@@ -1,50 +1,73 @@
 import boto3
-import json
 import pandas as pd
-from io import BytesIO
 import pyarrow as pa
 import pyarrow.parquet as pq
-from datetime import datetime, timezone
+from io import BytesIO
+from datetime import datetime, timedelta, timezone
 
-# --- Configuration ---
+# --- Config ---
 BUCKET_NAME = "call-records-data-dev-hp"
-DATE_PATH = datetime.now(timezone.utc).strftime("%Y/%m/%d")  # matches the upload path
-INPUT_KEY = f"{DATE_PATH}/call_data.json"
-OUTPUT_KEY = f"{DATE_PATH}/enriched.parquet"
+REGION = "us-east-1"
+DAYS_SPREAD = 5  # how many past days to process
 
 # --- AWS Clients ---
-s3 = boto3.client("s3", region_name="us-east-1")
-comprehend = boto3.client("comprehend", region_name="us-east-1")
+s3 = boto3.client("s3", region_name=REGION)
+comprehend = boto3.client("comprehend", region_name=REGION)
 
-# --- Load Data ---
-response = s3.get_object(Bucket=BUCKET_NAME, Key=INPUT_KEY)
-call_data = json.loads(response["Body"].read())
+def enrich_record(record):
+    text = record.get("summary", "")
+    if not text.strip():
+        return record
 
-# --- Enrich Records ---
-for record in call_data:
-    summary = record.get("summary", "")
-    if summary.strip():
-        sentiment_result = comprehend.detect_sentiment(Text=summary, LanguageCode="en")
-        keyphrases_result = comprehend.detect_key_phrases(Text=summary, LanguageCode="en")
+    try:
+        sentiment = comprehend.detect_sentiment(Text=text, LanguageCode="en")
+        key_phrases = comprehend.detect_key_phrases(Text=text, LanguageCode="en")
 
-        record["sentiment"] = {
-            "overall": sentiment_result["Sentiment"].lower(),
-            "confidence_score": sentiment_result["SentimentScore"][sentiment_result["Sentiment"].capitalize()]
-        }
+        record["sentiment_overall"] = sentiment["Sentiment"].lower()
+        record["sentiment_confidence"] = sentiment["SentimentScore"][sentiment["Sentiment"].capitalize()]
+        record["keywords"] = [phrase["Text"] for phrase in key_phrases["KeyPhrases"]]
+    except Exception as e:
+        print(f" Error processing summary: {e}")
 
-        record["keywords"] = [phrase["Text"] for phrase in keyphrases_result["KeyPhrases"]]
+    return record
 
-# --- Save as Parquet ---
-df = pd.DataFrame(call_data)
-table = pa.Table.from_pandas(df)
-pq_buffer = BytesIO()
-pq.write_table(table, pq_buffer)
+def process_day(offset):
+    now = datetime.now(timezone.utc) - timedelta(days=offset)
+    prefix = now.strftime("%Y/%m/%d")
+    input_key = f"{prefix}/call_data.parquet"
+    output_key = f"{prefix}/enriched.parquet"
+    local_csv_path = f"enriched_{prefix.replace('/', '-')}.csv"
 
-s3.put_object(
-    Bucket=BUCKET_NAME,
-    Key=OUTPUT_KEY,
-    Body=pq_buffer.getvalue(),
-    ContentType='application/octet-stream'
-)
+    print(f"Processing {input_key}...")
 
-print(f"✅ Enriched data written to s3://{BUCKET_NAME}/{OUTPUT_KEY}")
+    # Download parquet file from S3
+    response = s3.get_object(Bucket=BUCKET_NAME, Key=input_key)
+    df = pd.read_parquet(BytesIO(response["Body"].read()))
+
+    # Enrich each record
+    records = df.to_dict(orient="records")
+    enriched = [enrich_record(r) for r in records]
+    enriched_df = pd.DataFrame(enriched)
+
+    # Save to local CSV for verification
+    enriched_df.to_csv(local_csv_path, index=False)
+    print(f" Saved local CSV: {local_csv_path}")
+
+    # Convert back to Parquet
+    table = pa.Table.from_pandas(enriched_df)
+    buffer = BytesIO()
+    pq.write_table(table, buffer, compression="snappy")
+
+    # Upload enriched parquet to S3
+    s3.put_object(
+        Bucket=BUCKET_NAME,
+        Key=output_key,
+        Body=buffer.getvalue(),
+        ContentType="application/octet-stream"
+    )
+
+    print(f" Uploaded enriched file to s3://{BUCKET_NAME}/{output_key}")
+
+if __name__ == "__main__":
+    for day in range(DAYS_SPREAD):
+        process_day(day)
